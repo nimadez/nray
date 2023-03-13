@@ -1,0 +1,428 @@
+<!--
+    Jan 2023
+    1.1.5 pre-alpha
+    @nimadez
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+    <meta name="description" content="Fast raymarched pathtracer">
+    <meta name="author" content="@nimadez">
+    <meta name="twitter:card" content="summary">
+    <meta name="twitter:site" content="@nimadez">
+    <meta name="twitter:creator" content="@nimadez">
+    <meta name="twitter:title" content="nRay Pathtracer">
+    <meta name="twitter:description" content="Fast raymarched pathtracer">
+    <title>nRay Pathtracer</title>
+    <link rel="icon" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAAXNSR0IArs4c6QAAAYdJREFUWEftljFKxEAUht8z8QR6Aa0sBgSZrU3wBK6ClZV4BAvBiLDeQiv79QSiBzAowiJYiBdYK7dbNyMjJkzGmcybaIhItswm7//e//68CULLP2xZHzqAv+kA47FQszFKb5ygp5e946PN2wEglJ51ZexbYV1cFrABDIbcKpZspU5oWbs2QJV43jUFohYARVxCNAJAFae64OVAno+dwzdXtor/XS74ACDjcSYrB6GA7YPJp4gqYHLn1wD0t0O6oBdvDAAEPADCqup7BsHaY3p1r14z5gPhKemnK7aZOUcwWloM2cv4XS/gsxuqxlACYHx9F2DuQhUTCGcoYJ+6GX3HoAGUV7DJNtda/t8Aru6lY405QBG3AQBmG0n/7to0UnIGfgRQcS6QAKjissOTYW85APGsdzubzS8EwfRVPyMKAMbjcwDYq5N8/RnKgZXvBhXA+HHh030O0jqANYxfhOpmLByIoigcT3BK3XiU81h3wrSSK0NYx34KmHoP6cPRt6jP/R1A58AHeifOIQ6wmCMAAAAASUVORK5CYII=">
+    <link rel="stylesheet" href="styles/shared.css">
+</head>
+<body>
+<script src="scripts/ui.js"></script>
+<script src="scripts/shared.js"></script>
+<!-- THREE -->
+<script type="importmap">{"imports": {"three": "https://cdn.jsdelivr.net/gh/mrdoob/three.js@dev/build/three.module.js"}}</script>
+<script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'https://cdn.jsdelivr.net/gh/mrdoob/three.js@dev/examples/jsm/controls/OrbitControls.js';
+    import { RGBELoader } from 'https://cdn.jsdelivr.net/gh/mrdoob/three.js@dev/examples/jsm/loaders/RGBELoader.js';
+
+    const pointer = new THREE.Vector3();
+    let width = canvas.clientWidth * DPR;
+    let height = canvas.clientHeight * DPR;
+    let then = performance.now();
+    let prevTime = performance.now();
+    let currFrames = 0;
+    let rttTexture = null;
+    let noiseTexture = null;
+    let envTexture = null;
+    let heightTexture = null;
+    let dataTexture = getDataTexture(MAXDATATEX);
+
+    const renderer = new THREE.WebGLRenderer({ canvas: canvas, antialias: false, preserveDrawingBuffer: true });
+    renderer.setSize(width, height, false);
+    renderer.setPixelRatio(DPR);
+    renderer.setClearColor(0x000000, 0);
+    renderer.info.autoReset = false;
+
+    const sceneA = new THREE.Scene();
+    const sceneB = new THREE.Scene();
+
+    const camOrtho = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+    const camPersp = new THREE.PerspectiveCamera(45, width/height, 0.1, 100);
+    camPersp.position.set(6, -2, -6); // initial-scene position
+    //camPersp.lookAt(new THREE.Vector3(0, 8, 0));
+
+    const controls = new OrbitControls(camPersp, renderer.domElement);
+    controls.target = new THREE.Vector3(0, 8, 0);
+    controls.minDistance = 0.1;
+    controls.maxDistance = 100;
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.1; //0.05
+    controls.rotateSpeed = 0.4;
+
+    const RTTA = new THREE.WebGLRenderTarget(width, height, { type: THREE.FloatType, format: THREE.RGBAFormat, stencilBuffer: false, depthBuffer: false, minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter });
+    const RTTB = new THREE.WebGLRenderTarget(width, height, { type: THREE.FloatType, format: THREE.RGBAFormat, stencilBuffer: false, depthBuffer: false, minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter });
+    const CRTT = new THREE.WebGLCubeRenderTarget(512, { type: THREE.FloatType, format: THREE.RGBAFormat, stencilBuffer: false, depthBuffer: false, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter });
+    RTTA.texture.generateMipmaps = false;
+    RTTB.texture.generateMipmaps = false;
+    CRTT.texture.generateMipmaps = false;
+
+    let imageFragment = null;
+    let renderFragment = null;
+    await loadFile('shaders/image.fs').then(data => {
+        imageFragment = data;
+    });
+    await loadFile('shaders/render.fs').then(data => {
+        renderFragment = data;
+    });
+
+    await loadTexture(blueNoise).then(tex => {
+        tex.wrapS = THREE.RepeatWrapping;
+        tex.wrapT = THREE.RepeatWrapping;
+        tex.format = THREE.RGBAFormat;
+        tex.minFilter = THREE.NearestFilter;
+        tex.magFilter = THREE.NearestFilter;
+        tex.generateMipmaps = false;
+        noiseTexture = tex;
+    });
+
+    await loadTexture(heightMap).then(tex => {
+        tex.wrapS = THREE.RepeatWrapping;
+        tex.wrapT = THREE.RepeatWrapping;
+        tex.format = THREE.RGBAFormat;
+        tex.minFilter = THREE.LinearFilter;
+        tex.magFilter = THREE.LinearFilter;
+        tex.generateMipmaps = false;
+        heightTexture = tex;
+    });
+    
+    const uniImage = {
+        uResolution: { value: new THREE.Vector2() },
+        uBuffer: { value: rttTexture }
+    };
+    const uniRender = {
+        uResolution: { value: new THREE.Vector2() },
+        uFrame: { value: 0 },
+        uTime: { value: 0.0 },
+        uPointer: { value: new THREE.Vector3() },
+        uCamMatrix: { value: new THREE.Matrix4() },
+        uIsRendering: { value: isRendering },
+        uIsReset: { value: isReset },
+        uIsPerformance: { value: isPerformance },
+        uScene: { value: currScene },
+        uBuffer: { value: pingPong ? RTTA.texture : RTTB.texture },
+        uNoise: { value: noiseTexture },
+        uCubeMap: { value: envTexture },
+        uHeightMap: { value: heightTexture },
+        uData: { value: dataTexture }
+    };
+
+    const vertexShader = `precision highp float; void main() { gl_Position = vec4(position, 1.0); }`;
+    const geometry = new THREE.PlaneGeometry(2,2,1,1);
+    const planeA = new THREE.Mesh(geometry, new THREE.ShaderMaterial({
+        uniforms: uniImage,
+        vertexShader: vertexShader,
+        fragmentShader: imageFragment,
+        glslVersion: THREE.GLSL3,
+        depthTest: false,
+        depthWrite: false
+    }));
+    const planeB = new THREE.Mesh(geometry, new THREE.ShaderMaterial({
+        uniforms: uniRender,
+        vertexShader: vertexShader,
+        fragmentShader: renderFragment,
+        glslVersion: THREE.GLSL3,
+        depthTest: false,
+        depthWrite: false
+    }));
+    sceneA.add(planeA);
+    sceneB.add(planeB);
+
+    function animate() {
+        requestAnimationFrame(animate);
+        const now = performance.now();
+        const elapsed = now - then;
+        currFrames++;
+        if (isRendering && samples < 100 && elapsed > FPS) { //100% samples
+            then = now - (elapsed % FPS);
+            
+            uniImage['uResolution'].value.set(renderer.domElement.width, renderer.domElement.height);
+            uniImage['uBuffer'].value = rttTexture;
+            uniRender['uResolution'].value.set(renderer.domElement.width, renderer.domElement.height);
+            uniRender['uFrame'].value = frame;
+            uniRender['uTime'].value = now / 1000;
+            uniRender['uPointer'].value = pointer;
+            uniRender['uCamMatrix'].value = camPersp.matrixWorld;
+            uniRender['uIsRendering'].value = isRendering;
+            uniRender['uIsReset'].value = isReset;
+            uniRender['uIsPerformance'].value = isPerformance;
+            uniRender['uScene'].value = currScene;
+            uniRender['uBuffer'].value = pingPong ? RTTB.texture : RTTA.texture;
+            uniRender['uNoise'].value = noiseTexture;
+            uniRender['uCubeMap'].value = envTexture;
+            uniRender['uHeightMap'].value = heightTexture;
+            uniRender['uData'].value = dataTexture;
+            
+            renderer.render(sceneA, camPersp); // important
+
+            renderer.setRenderTarget(pingPong ? RTTA : RTTB);
+            renderer.clear();
+            renderer.render(sceneB, camOrtho);
+
+            rttTexture = pingPong ? RTTA.texture : RTTB.texture;
+            planeA.material.map = rttTexture;
+
+            renderer.setRenderTarget(null);
+            renderer.render(sceneA, camOrtho);
+            
+            pingPong ^= 1;
+            frame++;
+            samples = ~~Math.abs((frame/MAXSAMPLES)*100);
+            
+            setTimeout(() => {
+                domProgressBar.style.width = samples + '%';
+                domInfo.innerHTML = 
+                    `${Math.round((currFrames*1000)/(now-prevTime))} | ${timeFormat(frame)} | ` +
+                    `SL ${~~Math.abs((frame/MAXSAMPLES)*(MAXSAMPLES+2))} | ` +
+                    `${~~width}x${~~height} (${DPR}) | 1.1.5`;
+                prevTime = now;
+                currFrames = 0;
+            }, 0);
+        }
+        
+        controls.update();
+    }
+
+    loadHDR(envMap);
+    resize();
+    setTimeout(() => {
+        isRendering = true;
+    }, 1000);
+    animate();
+
+    // -------------------------------------------------------
+    // Functions
+
+    function resize() {
+        const size = parseInt(document.getElementById('rendersize').value);
+        DPR = parseFloat(document.getElementById('renderdpr').value);
+        canvasContainer.style.width = size + '%';
+        canvasContainer.style.height = size + '%';
+        canvasContainer.style.minWidth = size/8 + 'px';
+        width = canvas.clientWidth * DPR;
+        height = canvas.clientHeight * DPR;
+        camOrtho.aspect = width / height;
+        camOrtho.updateProjectionMatrix();
+        camPersp.aspect = width / height;
+        camPersp.updateProjectionMatrix();
+        renderer.setPixelRatio(DPR);
+        renderer.setSize(width, height, false);
+        renderReset();
+    }
+
+    function renderReset() {
+        RTTA.setSize(width, height);
+        RTTB.setSize(width, height);
+        frame = 1;
+        samples = 0;
+        isReset = true;
+        setTimeout(() => { isReset = false; }, 200);
+    }
+
+    function updateScene(scn) {
+        camPersp.position.set(camPos[scn][0], camPos[scn][1], camPos[scn][2]);
+        controls.target.set(camPos[scn][3], camPos[scn][4], camPos[scn][5]);
+        currScene = scn;
+        renderReset();
+    }
+
+    function loadHDR(envMap) {
+        const loader = new RGBELoader();
+        loader.type = THREE.FloatType;
+        loader.load(envMap, (tex) => {
+            tex.encoding = THREE.LinearEncoding;
+            tex.minFilter = THREE.LinearFilter;
+            tex.magFilter = THREE.LinearFilter;
+            tex.generateMipmaps = false;
+            tex.flipY = true;
+            envTexture = CRTT.fromEquirectangularTexture(renderer, tex).texture;
+            if (isRendering)
+                renderReset();
+        });
+    }
+
+    // -------------------------------------------------------
+    // Events
+
+    window.addEventListener('resize', (ev) => {
+        resize();
+    }, false);
+
+    window.addEventListener('contextmenu', (ev) => {
+        ev.preventDefault();
+    }, false);
+
+    canvas.addEventListener('pointerdown', (ev) => {
+        pointer.setZ(1);
+        pointer.setX((ev.offsetX / width) * (width / height));
+        pointer.setY(1 - (ev.offsetY / height));
+        if (isRendering) {
+            frame = 1;
+            isReset = true;
+            domFocusPoint.style.display = 'unset';
+        }
+    }, false);
+
+    canvas.addEventListener('pointerup', (ev) => {
+        pointer.setZ(0);
+        if (isRendering) {
+            frame = 1;
+            isReset = false;
+            domFocusPoint.style.display = 'none';
+        }
+    }, false);
+
+    canvas.addEventListener('pointermove', (ev) => {
+        if (pointer.z == 1) {
+            pointer.setX((ev.offsetX / width) * (width / height));
+            pointer.setY(1 - (ev.offsetY / height));
+        }
+    }, false);
+
+    canvas.addEventListener('wheel', (ev) => {
+        if (isRendering) {
+            frame = 1;
+            isReset = true;
+            setTimeout(() => { isReset = false; }, 200);
+        }
+    }, false);
+
+    canvas.addEventListener('drop', (ev) => {
+        ev.preventDefault();
+        if (ev.dataTransfer && ev.dataTransfer.files.length !== 0)
+            fileHandler(ev.dataTransfer.files[0]);
+    }, false);
+
+    canvas.addEventListener('dragover', (ev) => {
+        ev.preventDefault();
+    }, false);
+
+    canvas.addEventListener('dragleave', (ev) => {
+        ev.preventDefault();
+    }, false);
+
+    document.getElementById('openfile_hdr').addEventListener('change', (ev) => {
+        if (ev.target.files.length > 0)
+            fileHandler(ev.target.files[0]);
+    }, false);
+
+    function fileHandler(file) {
+        const ext = file.name.split('.').pop().toLowerCase(); //ext|exts
+        const url = URL.createObjectURL(file);
+        const reader = new FileReader();
+        reader.onload = function() {
+            if (ext === 'hdr') loadHDR(url);
+            URL.revokeObjectURL(url);
+        }
+        reader.readAsDataURL(file);
+    }
+
+    // -------------------------------------------------------
+    // Utils
+
+    async function loadFile(url) {
+        return new Promise(resolve => {
+            return new THREE.FileLoader().load(url, resolve);
+        });
+    }
+
+    async function loadTexture(url) {
+        return new Promise(resolve => {
+            new THREE.TextureLoader().load(url, resolve);
+        });
+    }
+
+    function getDataTexture(s) {
+        const geometry = new THREE.SphereGeometry(5, 8, 4);
+        const positions = geometry.attributes.position.array;
+        console.log(positions.length/3);
+        const size = s * s;
+        const data = new Float32Array(size * 4); //16777216 rgba
+        for (let i = 0; i < data.length; i++) {
+            data[ i * 8 + 0 ] = positions[ i + 0 ];
+            data[ i * 8 + 1 ] = positions[ i + 1 ];
+            data[ i * 8 + 2 ] = positions[ i + 2 ];
+            data[ i * 8 + 3 ] = 1;
+            data[ i * 8 + 4 ] = positions[ i + 3 ];
+            data[ i * 8 + 5 ] = positions[ i + 4 ];
+            data[ i * 8 + 6 ] = positions[ i + 5 ];
+            data[ i * 8 + 7 ] = 1;
+        }
+        const texture = new THREE.DataTexture(data, s, s, THREE.RGBAFormat, THREE.FloatType);
+        texture.minFilter =  THREE.NearestFilter;
+        texture.magFilter = THREE.NearestFilter;
+        texture.needsUpdate = true;
+        return texture;
+    }
+
+    // -------------------------------------------------------
+    // DOM
+
+    domPlayback.addEventListener('click', (ev) => {
+        isRendering = !isRendering;
+        if (isRendering) {
+            domPlayback.firstChild.innerHTML = "pause";
+        } else {
+            domPlayback.firstChild.innerHTML = "play_arrow";
+            if (samples == 100) {
+                samples = 0;
+                renderReset();
+            }
+        }
+        controls.enabled = isRendering;
+    }, false);
+
+    domSceneSelect.addEventListener('change', (ev) => {
+        updateScene(domSceneSelect.options[domSceneSelect.selectedIndex].value);
+    }, false);
+
+    domRenderSize.addEventListener('input', (ev) => {
+        resize();
+    }, false);
+
+    domRenderDpr.addEventListener('input', (ev) => {
+        resize();
+    }, false);
+
+    domPerformance.addEventListener('click', (ev) => {
+        isPerformance = !isPerformance;
+        if (isPerformance) {
+            domPerformance.style.color = 'yellowgreen';
+        } else {
+            domPerformance.style.color = '#eee';
+        }
+        renderReset();
+    }, false);
+
+    domScreenshot.addEventListener('click', (ev) => {
+        let img = new Image();
+        img.src = renderer.domElement.toDataURL('image/png');
+        img.onload = () => {
+            window.open('', '_blank').document.write(img.outerHTML);
+            img = null;
+        };
+    }, false);
+
+    domOptionsBtn.addEventListener('click', (ev) => {
+        if (domOptions.style.display == 'unset') {
+            domOptions.style.display = 'none';
+        } else {
+            domOptions.style.display = 'unset';
+        }
+    }, false);
+</script>
+</body>
+</html>

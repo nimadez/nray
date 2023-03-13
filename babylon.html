@@ -1,0 +1,406 @@
+<!--
+    Jan 2023
+    1.1.5 pre-alpha
+    @nimadez
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+    <meta name="description" content="Fast raymarched pathtracer">
+    <meta name="author" content="@nimadez">
+    <meta name="twitter:card" content="summary">
+    <meta name="twitter:site" content="@nimadez">
+    <meta name="twitter:creator" content="@nimadez">
+    <meta name="twitter:title" content="nRay Pathtracer">
+    <meta name="twitter:description" content="Fast raymarched pathtracer">
+    <title>nRay Pathtracer (BABYLON)</title>
+    <link rel="icon" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAAXNSR0IArs4c6QAAAYdJREFUWEftljFKxEAUht8z8QR6Aa0sBgSZrU3wBK6ClZV4BAvBiLDeQiv79QSiBzAowiJYiBdYK7dbNyMjJkzGmcybaIhItswm7//e//68CULLP2xZHzqAv+kA47FQszFKb5ygp5e946PN2wEglJ51ZexbYV1cFrABDIbcKpZspU5oWbs2QJV43jUFohYARVxCNAJAFae64OVAno+dwzdXtor/XS74ACDjcSYrB6GA7YPJp4gqYHLn1wD0t0O6oBdvDAAEPADCqup7BsHaY3p1r14z5gPhKemnK7aZOUcwWloM2cv4XS/gsxuqxlACYHx9F2DuQhUTCGcoYJ+6GX3HoAGUV7DJNtda/t8Aru6lY405QBG3AQBmG0n/7to0UnIGfgRQcS6QAKjissOTYW85APGsdzubzS8EwfRVPyMKAMbjcwDYq5N8/RnKgZXvBhXA+HHh030O0jqANYxfhOpmLByIoigcT3BK3XiU81h3wrSSK0NYx34KmHoP6cPRt6jP/R1A58AHeifOIQ6wmCMAAAAASUVORK5CYII=">
+    <link rel="stylesheet" href="styles/shared.css">
+</head>
+<body>
+<script src="scripts/ui.js"></script>
+<script src="scripts/shared.js"></script>
+<!-- BABYLON -->
+<script src="https://nimadez.github.io/voxel-builder/libs/babylon.js"></script>
+<script>
+    const pointer = BABYLON.Vector3.Zero();
+    let width = canvas.clientWidth * DPR;
+    let height = canvas.clientHeight * DPR;
+    let then = performance.now();
+    let rttTexture = null;
+    let noiseTexture = null;
+    let envTexture = new BABYLON.Texture();
+    let heightTexture = null;
+    let dataTexture = null;
+
+    const engine = new BABYLON.Engine(canvas, false, {});
+    engine.setHardwareScalingLevel(1.0 / DPR);
+    engine.disablePerformanceMonitorInBackground = true;
+    engine.preserveDrawingBuffer = true;
+    engine.premultipliedAlpha = false;
+    engine.enableOfflineSupport = false;
+    engine.doNotHandleContextLost = true;
+
+    const scene = new BABYLON.Scene(engine);
+    scene.clearColor = new BABYLON.Color4(0,0,0,0);
+    scene.autoClear = false;
+    scene.autoClearDepthAndStencil = false;
+    scene.blockMaterialDirtyMechanism = true;
+    scene.useRightHandedSystem = true;
+
+    const camera = new BABYLON.ArcRotateCamera("camera", 0, 0, 10, BABYLON.Vector3.Zero(), scene);
+    camera.setPosition(new BABYLON.Vector3(6, -2, -6)); // initial-scene position
+    camera.setTarget(new BABYLON.Vector3(0, 8, 0));
+    camera.attachControl(canvas, true);
+    camera.fov = 0; // overrided
+    camera.minZ = 0.01;
+    camera.maxZ = 1000;
+    camera.inertia = 0.8;
+    camera.lowerRadiusLimit = 0.1;
+    camera.upperRadiusLimit = 100;
+    camera.wheelPrecision = 10; //def: 3
+    camera.pinchPrecision = 40; //def: 12
+    camera.panningSensibility = 300; //def: 1000
+
+    const blur = 0.05;
+    const skybox = BABYLON.MeshBuilder.CreateBox('skybox', { size: 500 }, scene);
+    skybox.scaling.x *= -1;
+    skybox.scaling.y *= -1;
+    skybox.rotation.y = -Math.PI/2;
+    skybox.material = new BABYLON.PBRMaterial("skybox", scene);
+    skybox.material.reflectionTexture = envTexture.clone();
+    skybox.material.reflectionTexture.coordinatesMode = BABYLON.Texture.SKYBOX_MODE;
+    skybox.material.microSurface = 1.0 - blur;
+    skybox.material.disableLighting = true;
+    skybox.material.twoSidedLighting = true;
+    skybox.material.backFaceCulling = false;
+    skybox.infiniteDistance = true;
+    skybox.ignoreCameraMaxZ = true;
+    skybox.doNotSyncBoundingInfo = true;
+    skybox.convertToUnIndexedMesh();
+    skybox.freezeWorldMatrix();
+    skybox.freezeNormals();
+    const probe = new BABYLON.ReflectionProbe('probe', 512, scene);
+    probe.refreshRate = BABYLON.RenderTargetTexture.REFRESHRATE_RENDER_ONCE;
+    probe.renderList.push(skybox);
+    probe.attachToMesh(skybox);
+    scene.environmentTexture = probe.cubeTexture;
+
+    noiseTexture = new BABYLON.Texture(blueNoise, scene, true, false, BABYLON.Texture.NEAREST_SAMPLINGMODE, undefined, undefined, undefined, false, BABYLON.Constants.TEXTUREFORMAT_RGBA);
+    noiseTexture.gammaSpace = false;
+
+    heightTexture = new BABYLON.Texture(heightMap, scene, true, false, BABYLON.Texture.LINEAR_LINEAR, undefined, undefined, undefined, false, BABYLON.Constants.TEXTUREFORMAT_RGBA);
+    heightTexture.gammaSpace = false;
+
+    dataTexture = getDataTexture(MAXDATATEX);
+
+    const RTTA = new BABYLON.RenderTargetTexture("RTTA", { width, height }, scene, BABYLON.Constants.TEXTURETYPE_FLOAT, false, BABYLON.Constants.TEXTURE_NEAREST_SAMPLINGMODE, false, false, false, BABYLON.Constants.TEXTUREFORMAT_RGBA);
+    const RTTB = new BABYLON.RenderTargetTexture("RTTB", { width, height }, scene, BABYLON.Constants.TEXTURETYPE_FLOAT, false, BABYLON.Constants.TEXTURE_NEAREST_SAMPLINGMODE, false, false, false, BABYLON.Constants.TEXTUREFORMAT_RGBA);
+    RTTA.clearColor = scene.clearColor;
+    RTTB.clearColor = scene.clearColor;
+    rttTexture = pingPong ? RTTA : RTTB;
+
+    loadShader('shaders/image.fs', (data) => {
+        data = '#version 300 es\n#define BABYLON\n' + data;
+
+        BABYLON.Effect.ShadersStore["imageFragmentShader"] = data;
+        const postProcess = new BABYLON.PostProcess("postprocess", "image", 
+            ["uResolution"],
+            ["uBuffer"],
+            1.0, camera);
+
+        postProcess.onApply = (effect) => {
+            effect.setVector2("uResolution", new BABYLON.Vector2(
+                scene.getEngine().getRenderWidth(), scene.getEngine().getRenderHeight()
+            ));
+            effect.setTexture("uBuffer", rttTexture);
+        };
+    });
+
+    loadShader('shaders/render.fs', (data) => {
+        data = '#version 300 es\n#define BABYLON\n' + data;
+
+        BABYLON.Effect.ShadersStore["renderFragmentShader"] = data;
+        const fxRender = new BABYLON.EffectWrapper({
+            engine: engine,
+            useShaderStore: false,
+            fragmentShader: BABYLON.Effect.ShadersStore["renderFragmentShader"],
+            uniformNames: ["uResolution", "uFrame", "uTime", "uPointer",
+                           "uCamMatrix",
+                           "uIsRendering", "uIsReset", "uIsPerformance", 
+                           "uScene"],
+            samplerNames: ["uBuffer", "uNoise", "uCubeMap", "uHeightMap", "uData"],
+            name: "fxRender"
+        });
+
+        fxRender.onApplyObservable.add(() => {
+            fxRender.effect.setVector2("uResolution", new BABYLON.Vector2(
+                scene.getEngine().getRenderWidth(), scene.getEngine().getRenderHeight()
+            ));
+            fxRender.effect.setInt("uFrame", frame);
+            fxRender.effect.setFloat("uTime", performance.now()/1000);
+            fxRender.effect.setVector3("uPointer", pointer);
+            fxRender.effect.setMatrix("uCamMatrix", camera.getWorldMatrix());
+            fxRender.effect.setBool("uIsRendering", isRendering);
+            fxRender.effect.setBool("uIsReset", isReset);
+            fxRender.effect.setBool("uIsPerformance", isPerformance);
+            fxRender.effect.setInt("uScene", currScene);
+            fxRender.effect.setTexture("uBuffer", pingPong ? RTTB : RTTA);
+            fxRender.effect.setTexture("uNoise", noiseTexture);
+            fxRender.effect.setTexture("uCubeMap", probe.cubeTexture);
+            fxRender.effect.setTexture("uHeightMap", heightTexture);
+            fxRender.effect.setTexture("uData", dataTexture);
+        });
+
+        const fxRenderer = new BABYLON.EffectRenderer(engine);
+        engine.runRenderLoop(() => {
+            const now = performance.now();
+            const elapsed = now - then;
+            if (isRendering && samples < 100 && elapsed > FPS) { //100% samples
+                then = now - (elapsed % FPS);
+
+                scene.render();
+                
+                rttTexture = pingPong ? RTTA : RTTB;    
+                fxRenderer.render(fxRender, rttTexture);
+                
+                pingPong ^= 1;
+                frame++;
+                samples = ~~Math.abs((frame/MAXSAMPLES)*100);
+
+                setTimeout(() => {
+                    domProgressBar.style.width = samples + '%';
+                    domInfo.innerHTML = 
+                        `${~~(engine.getFps())} | ${timeFormat(frame)} | ` +
+                        `SL ${~~Math.abs((frame/MAXSAMPLES)*(MAXSAMPLES+2))} | ` +
+                        `${~~width}x${~~height} (${DPR}) | 1.1.5`;
+                }, 0);
+            }
+        });
+
+        loadHDR(envMap);
+        resize();
+        setTimeout(() => {
+            isRendering = true;
+        }, 1000);
+    });
+
+    // -------------------------------------------------------
+    // Functions
+
+    function resize() {
+        const size = parseInt(document.getElementById('rendersize').value);
+        DPR = parseFloat(document.getElementById('renderdpr').value);
+        canvasContainer.style.width = size + '%';
+        canvasContainer.style.height = size + '%';
+        canvasContainer.style.minWidth = size/8 + 'px';
+        width = canvas.clientWidth * DPR;
+        height = canvas.clientHeight * DPR;
+        engine.setHardwareScalingLevel(1.0 / DPR);
+        engine.setSize(width, height, false);
+        renderReset();
+    }
+
+    function renderReset() {
+        RTTA.resize({ width: width, height: height });
+        RTTB.resize({ width: width, height: height });
+        frame = 1;
+        samples = 0;
+        isReset = true;
+        setTimeout(() => { isReset = false; }, 200);
+    }
+
+    function updateScene(scn) {
+        camera.setPosition(new BABYLON.Vector3(camPos[scn][0], camPos[scn][1], camPos[scn][2]));
+        camera.setTarget(new BABYLON.Vector3(camPos[scn][3], camPos[scn][4], camPos[scn][5]));
+        currScene = scn;
+        renderReset();
+    }
+
+    function loadHDR(url) {
+        envTexture = new BABYLON.HDRCubeTexture(url, scene, 512, undefined,undefined,undefined,undefined, () => {
+            envTexture.gammaSpace = true;
+            skybox.material.reflectionTexture = envTexture.clone();
+            skybox.material.reflectionTexture.coordinatesMode = BABYLON.Texture.SKYBOX_MODE;
+            probe.refreshRate = BABYLON.RenderTargetTexture.REFRESHRATE_RENDER_ONCE;
+            if (isRendering)
+                renderReset();
+        });
+    }
+
+    // -------------------------------------------------------
+    // Events
+
+    window.addEventListener('resize', (ev) => {
+        resize();
+    }, false);
+
+    window.addEventListener('contextmenu', (ev) => {
+        ev.preventDefault();
+    }, false);
+
+    scene.onPointerObservable.add((pInfo) => {
+        switch (pInfo.type) {
+            case BABYLON.PointerEventTypes.POINTERDOWN:
+                pointer.z = 1;
+                pointer.x = (scene.pointerX / width) * (width / height);
+                pointer.y = 1 - (scene.pointerY / height);
+                if (isRendering) {
+                    frame = 1;
+                    isReset = true;
+                    domFocusPoint.style.display = 'unset';
+                }
+                break;
+            case BABYLON.PointerEventTypes.POINTERUP:
+                pointer.z = 0;
+                if (isRendering) {
+                    frame = 1;
+                    isReset = false;
+                    domFocusPoint.style.display = 'none';
+                }
+                break;
+            case BABYLON.PointerEventTypes.POINTERMOVE:
+                if (pointer.z == 1) {
+                    pointer.x = (scene.pointerX / width) * (width / height);
+                    pointer.y = 1 - (scene.pointerY / height);
+                }
+                break;
+            case BABYLON.PointerEventTypes.POINTERWHEEL:
+                if (isRendering) {
+                    frame = 1;
+                    isReset = true;
+                    setTimeout(() => { isReset = false; }, 500);
+                }
+                break;
+        }
+    });
+
+    canvas.addEventListener('drop', (ev) => {
+        ev.preventDefault();
+        if (ev.dataTransfer && ev.dataTransfer.files.length !== 0)
+            fileHandler(ev.dataTransfer.files[0]);
+    }, false);
+
+    canvas.addEventListener('dragover', (ev) => {
+        ev.preventDefault();
+    }, false);
+
+    canvas.addEventListener('dragleave', (ev) => {
+        ev.preventDefault();
+    }, false);
+
+    document.getElementById('openfile_hdr').addEventListener('change', (ev) => {
+        if (ev.target.files.length > 0)
+            fileHandler(ev.target.files[0]);
+    }, false);
+
+    function fileHandler(file) {
+        const ext = file.name.split('.').pop().toLowerCase(); //ext|exts
+        const url = URL.createObjectURL(file);
+        const reader = new FileReader();
+        reader.onload = function() {
+            if (ext === 'hdr') loadHDR(url);
+            URL.revokeObjectURL(url);
+        }
+        reader.readAsDataURL(file);
+    }
+
+    // -------------------------------------------------------
+    // Utils
+
+    async function loadShader(src, callback) {
+        const script = document.createElement('script');
+        script.type = 'x-shader/x-fragment';
+        script.src = src;
+        script.async = false;
+        script.defer = false;
+        const response = await fetch(src);
+        const data = await response.text();
+        script.onload = callback(data);
+    }
+
+    function getDataTexture(s) {
+        let sphere = BABYLON.MeshBuilder.CreateSphere("sphere", { diameter: 10, segments: 2 }, scene);
+        const positions = sphere.getVerticesData(BABYLON.VertexBuffer.PositionKind);
+        sphere.dispose();
+        sphere = null;
+        console.log(positions.length/3);
+        const size = s * s;
+        const data = new Float32Array(size * 4); //16777216 rgba
+        for (let i = 0; i < data.length; i++) {
+            data[ i * 8 + 0 ] = positions[ i + 0 ];
+            data[ i * 8 + 1 ] = positions[ i + 1 ];
+            data[ i * 8 + 2 ] = positions[ i + 2 ];
+            data[ i * 8 + 3 ] = 1;
+            data[ i * 8 + 4 ] = positions[ i + 3 ];
+            data[ i * 8 + 5 ] = positions[ i + 4 ];
+            data[ i * 8 + 6 ] = positions[ i + 5 ];
+            data[ i * 8 + 7 ] = 1;
+        }
+        return BABYLON.RawTexture.CreateRGBATexture(data, s, s, scene, false, false,
+                BABYLON.Constants.TEXTURE_NEAREST_SAMPLINGMODE, BABYLON.Constants.TEXTURETYPE_FLOAT);
+    }
+
+    // -------------------------------------------------------
+    // DOM
+
+    domPlayback.addEventListener('click', (ev) => {
+        isRendering = !isRendering;
+        if (isRendering) {
+            domPlayback.firstChild.innerHTML = "pause";
+            camera.attachControl(canvas, true);
+        } else {
+            domPlayback.firstChild.innerHTML = "play_arrow";
+            camera.detachControl(canvas);
+            if (samples == 100) {
+                samples = 0;
+                renderReset();
+            }
+        }
+    }, false);
+
+    domSceneSelect.addEventListener('change', (ev) => {
+        updateScene(domSceneSelect.options[domSceneSelect.selectedIndex].value);
+    }, false);
+
+    domRenderSize.addEventListener('input', (ev) => {
+        resize();
+    }, false);
+
+    domRenderDpr.addEventListener('input', (ev) => {
+        resize();
+    }, false);
+
+    domPerformance.addEventListener('click', (ev) => {
+        isPerformance = !isPerformance;
+        if (isPerformance) {
+            domPerformance.style.color = 'yellowgreen';
+        } else {
+            domPerformance.style.color = '#eee';
+        }
+        renderReset();
+    }, false);
+
+    domScreenshot.addEventListener('click', (ev) => {
+        scene.render();
+        BABYLON.ScreenshotTools.CreateScreenshot(
+            engine, camera, { precision: 1 }, (data) => {
+                let image = new Image();
+                image.src = data;
+                window.open('', '_blank').document.write(image.outerHTML);
+                image = null;
+            });
+    }, false);
+
+    domOptionsBtn.addEventListener('click', (ev) => {
+        if (domOptions.style.display == 'unset') {
+            domOptions.style.display = 'none';
+        } else {
+            domOptions.style.display = 'unset';
+        }
+    }, false);
+</script>
+</body>
+</html>
